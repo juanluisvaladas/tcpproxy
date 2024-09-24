@@ -71,9 +71,10 @@ import (
 type Proxy struct {
 	configs map[string]*config // ip:port => config
 
-	lns   []net.Listener
-	donec chan struct{} // closed before err
-	err   error         // any error from listening
+	lns        []net.Listener
+	donec      chan struct{} // closed before err
+	err        error         // any error from listening
+	routesChan chan route
 
 	// ListenFunc optionally specifies an alternate listen
 	// function. If nil, net.Dial is used.
@@ -156,8 +157,12 @@ func (p *Proxy) setRoutes(ipPort string, targets []Target) {
 // SetRoutes replaces routes for the ipPort.
 //
 // It's possible that the old routes are still used once after this
-// function is called.
+// function is called. If an empty slice is passed, the routes are
+// preserved in order to avoid an infinite loop.
 func (p *Proxy) SetRoutes(ipPort string, targets []Target) {
+	if len(targets) == 0 {
+		return
+	}
 	p.setRoutes(ipPort, targets)
 }
 
@@ -215,6 +220,7 @@ func (p *Proxy) Start() error {
 			return err
 		}
 		p.lns = append(p.lns, ln)
+		p.routesChan = make(chan route)
 		go p.serveListener(errc, ln, config)
 	}
 	go p.awaitFirstError(errc)
@@ -233,6 +239,7 @@ func (p *Proxy) serveListener(ret chan<- error, ln net.Listener, cfg *config) {
 			ret <- err
 			return
 		}
+		go p.roundRobin(cfg)
 		go p.serveConn(c, cfg)
 	}
 }
@@ -241,7 +248,8 @@ func (p *Proxy) serveListener(ret chan<- error, ln net.Listener, cfg *config) {
 // It returns whether it matched purely for testing.
 func (p *Proxy) serveConn(c net.Conn, cfg *config) bool {
 	br := bufio.NewReader(c)
-	for _, route := range cfg.routes {
+	for i := 0; i < len(cfg.routes); i++ {
+		route := <-p.routesChan
 		if target, hostName := route.match(br); target != nil {
 			if n := br.Buffered(); n > 0 {
 				peeked, _ := br.Peek(br.Buffered())
@@ -259,6 +267,15 @@ func (p *Proxy) serveConn(c net.Conn, cfg *config) bool {
 	log.Printf("tcpproxy: no routes matched conn %v/%v; closing", c.RemoteAddr().String(), c.LocalAddr().String())
 	c.Close()
 	return false
+}
+
+// roundRobin writes to a channel the next route to use.
+func (p *Proxy) roundRobin(cfg *config) {
+	for {
+		for _, route := range cfg.routes {
+			p.routesChan <- route
+		}
+	}
 }
 
 // Conn is an incoming connection that has had some bytes read from it
